@@ -19,8 +19,10 @@ import {
   findNodeHandle,
   UIManager,
   Animated,
+  SafeAreaView,
 } from 'react-native';
 import { useTheme, ThemeContextValue } from '../../contexts/theme/ThemeContext';
+import { useNavigation } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { Picker } from '@react-native-picker/picker';
@@ -50,6 +52,7 @@ const MedicationScreen = () => {
   const theme = useTheme();
   const { colors, isDark } = theme;
   const { user } = useAuth();
+  const navigation = useNavigation();
 
   const [medications, setMedications] = useState<Medication[]>([]);
   const [modalVisible, setModalVisible] = useState(false);
@@ -388,7 +391,20 @@ const MedicationScreen = () => {
   );
 
   return (
-    <View style={styles.container}>
+    <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
+      {/* Custom Header */}
+      <View style={[styles.header, { backgroundColor: colors.background, borderBottomColor: colors.border }]}>
+        <TouchableOpacity 
+          onPress={() => navigation.goBack()} 
+          style={styles.backButton}
+          activeOpacity={0.7}
+        >
+          <Ionicons name="arrow-back" size={24} color={colors.text} />
+        </TouchableOpacity>
+        <Text style={[styles.headerTitle, { color: colors.text }]}>Medications</Text>
+        <View style={styles.headerRight} />
+      </View>
+
       <FlatList
         data={medications}
         renderItem={renderMedicationItem}
@@ -660,7 +676,7 @@ const MedicationScreen = () => {
           </View>
         </TouchableWithoutFeedback>
       </Modal>
-    </View>
+    </SafeAreaView>
   );
 };
 
@@ -935,9 +951,6 @@ const getStyles = (colors: any) =>
     editButton: {
       borderColor: colors.primary,
     },
-    deleteButton: {
-      borderColor: '#FECACA',
-    },
     actionButtonIcon: {
       marginRight: 6,
     },
@@ -989,6 +1002,26 @@ const getStyles = (colors: any) =>
       alignItems: 'center',
       justifyContent: 'center',
       minWidth: 120,
+    },
+    header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: 16,
+      paddingVertical: 12,
+      borderBottomWidth: 1,
+    },
+    backButton: {
+      padding: 8,
+      marginRight: 12,
+    },
+    headerTitle: {
+      flex: 1,
+      fontSize: 20,
+      fontWeight: '700',
+    },
+    headerRight: {
+      width: 40,
     },
   });
 
