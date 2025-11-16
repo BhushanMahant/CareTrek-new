@@ -110,11 +110,22 @@ const MapScreen: React.FC = () => {
 
   // Turn-by-turn navigation state
   const [routeCoords, setRouteCoords] = useState<Array<{ latitude: number; longitude: number }>>([]);
-  const [routeSteps, setRouteSteps] = useState<Array<{ instruction: string; lat: number; lng: number }>>([]);
+  const [routeSteps, setRouteSteps] = useState<Array<{ instruction: string; lat: number; lng: number; distance?: number; duration?: number }>>([]);
   const [isNavigating, setIsNavigating] = useState(false);
+  const [totalDistance, setTotalDistance] = useState<number>(0);
+  const [totalDuration, setTotalDuration] = useState<number>(0);
   const navAnimRef = useRef<number | null>(null);
   const navIndexRef = useRef<number>(0);
   const { user } = useAuth();
+
+  // Search state
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [showSearchResults, setShowSearchResults] = useState(false);
+  const [searchTimeout, setSearchTimeout] = useState<NodeJS.Timeout | null>(null);
+  const [selectedLocation, setSelectedLocation] = useState<any>(null);
+  const [showLocationDetails, setShowLocationDetails] = useState(false);
+  const [pinnedLocation, setPinnedLocation] = useState<any>(null);
 
   // Request location permission for both Android and iOS
   const requestLocationPermission = useCallback(async () => {
@@ -598,11 +609,10 @@ const MapScreen: React.FC = () => {
     } 
   };
 
-  // Navigation functions
+  // Simple straight-line navigation fallback
   const startNavigation = useCallback((destination: { latitude: number; longitude: number }) => {
     if (!currentLocation) return;
     
-    // Simple straight-line navigation for demo
     const newRoute = [
       { latitude: currentLocation.latitude, longitude: currentLocation.longitude },
       destination
@@ -614,7 +624,6 @@ const MapScreen: React.FC = () => {
     ]);
     setIsNavigating(true);
     
-    // Center map on route
     mapRef.current?.fitToCoordinates(newRoute, {
       edgePadding: { top: 100, right: 50, bottom: 200, left: 50 },
       animated: true,
@@ -625,25 +634,34 @@ const MapScreen: React.FC = () => {
     if (!currentLocation) return;
     
     try {
-      const url = `https://router.project-osrm.org/route/v1/driving/${currentLocation.longitude},${currentLocation.latitude};${lng},${lat}?overview=full&geometries=geojson`;
+      const url = `https://router.project-osrm.org/route/v1/driving/${currentLocation.longitude},${currentLocation.latitude};${lng},${lat}?overview=full&geometries=geojson&steps=true`;
       const res = await fetch(url);
       const json = await res.json();
       
       if (json.routes && json.routes.length) {
-        const coords = json.routes[0].geometry.coordinates.map((c: any) => ({ 
+        const route = json.routes[0];
+        const coords = route.geometry.coordinates.map((c: any) => ({ 
           latitude: c[1], 
           longitude: c[0] 
         }));
         
         setRouteCoords(coords);
         
-        const steps: Array<{ instruction: string; lat: number; lng: number }> = [];
-        (json.routes[0].legs || []).forEach((leg: any) => { 
+        // Extract total distance (in meters) and duration (in seconds)
+        const distance = route.distance || 0; // meters
+        const duration = route.duration || 0; // seconds
+        setTotalDistance(distance);
+        setTotalDuration(duration);
+        
+        const steps: Array<{ instruction: string; lat: number; lng: number; distance?: number; duration?: number }> = [];
+        (route.legs || []).forEach((leg: any) => { 
           (leg.steps || []).forEach((s: any) => { 
             steps.push({ 
               instruction: s.maneuver?.instruction || 'Proceed', 
               lat: s.maneuver?.location?.[1] || lat, 
-              lng: s.maneuver?.location?.[0] || lng 
+              lng: s.maneuver?.location?.[0] || lng,
+              distance: s.distance,
+              duration: s.duration
             }); 
           }); 
         });
@@ -713,6 +731,99 @@ const MapScreen: React.FC = () => {
     navigation.navigate('HomeLocation');
   }, [navigation]);
 
+  // Search for locations
+  const searchLocations = useCallback(async (query: string) => {
+    if (!query.trim()) {
+      setSearchResults([]);
+      return;
+    }
+
+    if (searchTimeout) clearTimeout(searchTimeout);
+
+    const timeout = setTimeout(async () => {
+      try {
+        const googleMapsApiKey = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_API_KEY;
+        
+        if (!googleMapsApiKey) {
+          // Fallback to Nominatim
+          const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=8`;
+          const response = await fetch(url);
+          const data = await response.json();
+          setSearchResults(data || []);
+          return;
+        }
+
+        const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(query)}&key=${googleMapsApiKey}`;
+        const response = await fetch(url);
+        const data = await response.json();
+
+        if (data.predictions) {
+          setSearchResults(data.predictions.map((p: any) => ({
+            place_id: p.place_id,
+            display_name: p.description,
+            lat: p.geometry?.location?.lat || 0,
+            lon: p.geometry?.location?.lng || 0,
+          })));
+        }
+      } catch (error) {
+        console.error('Search error:', error);
+      }
+    }, 300);
+
+    setSearchTimeout(timeout);
+  }, [searchTimeout]);
+
+  // Navigate to search result
+  const navigateToSearchResult = useCallback(async (result: any) => {
+    let lat = parseFloat(result.lat);
+    let lon = parseFloat(result.lon);
+
+    // If using Google Places, get details for accurate coordinates
+    if (result.place_id && (!lat || !lon)) {
+      try {
+        const googleMapsApiKey = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY || process.env.GOOGLE_MAPS_API_KEY;
+        if (googleMapsApiKey) {
+          const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${result.place_id}&key=${googleMapsApiKey}`;
+          const response = await fetch(url);
+          const data = await response.json();
+          if (data.result?.geometry?.location) {
+            lat = data.result.geometry.location.lat;
+            lon = data.result.geometry.location.lng;
+          }
+        }
+      } catch (error) {
+        console.error('Error getting place details:', error);
+      }
+    }
+    
+    // Center on selected location
+    mapRef.current?.animateToRegion({
+      latitude: lat,
+      longitude: lon,
+      latitudeDelta: 0.02,
+      longitudeDelta: 0.02,
+    });
+
+    setSelectedLocation({ ...result, latitude: lat, longitude: lon });
+    setPinnedLocation({ latitude: lat, longitude: lon });
+    setShowLocationDetails(true);
+    setSearchQuery('');
+    setSearchResults([]);
+    setShowSearchResults(false);
+  }, []);
+
+  // Navigate to home using proper routing
+  const navigateToHomeWithRoute = useCallback(() => {
+    if (homeLocation) {
+      startNavigationTo(homeLocation.latitude, homeLocation.longitude);
+    } else {
+      Alert.alert('Home Location Not Set', 'Please set your home location first', [
+        { text: 'Set Now', onPress: () => navigation.navigate('HomeLocation') },
+        { text: 'Cancel', style: 'cancel' }
+      ]);
+    }
+  }, [homeLocation, startNavigationTo, navigation]);
+
   // ---------- Render ----------
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: isDark ? '#0F1724' : '#FFFBEF' }]}>
@@ -738,6 +849,52 @@ const MapScreen: React.FC = () => {
           </TouchableOpacity>
         </View>
       </View>
+
+      {/* Search Bar */}
+      <View style={[styles.searchContainer, { backgroundColor: isDark ? '#1A2332' : '#FFFFFF', borderBottomColor: isDark ? '#2D3E52' : '#E5E7EB' }]}>
+        <View style={[styles.searchBarWrapper, { backgroundColor: isDark ? '#2D3E52' : '#F3F4F6' }]}>
+          <Ionicons name="search" size={18} color={isDark ? '#9CA3AF' : '#6B7280'} />
+          <TextInput
+            style={[styles.searchInput, { color: isDark ? '#E2E8F0' : '#1A202C' }]}
+            placeholder="Search locations..."
+            placeholderTextColor={isDark ? '#9CA3AF' : '#9CA3AF'}
+            value={searchQuery}
+            onChangeText={(text) => {
+              setSearchQuery(text);
+              searchLocations(text);
+              setShowSearchResults(true);
+            }}
+          />
+          {searchQuery.length > 0 && (
+            <TouchableOpacity onPress={() => {
+              setSearchQuery('');
+              setSearchResults([]);
+              setShowSearchResults(false);
+            }}>
+              <Ionicons name="close-circle" size={18} color={isDark ? '#9CA3AF' : '#6B7280'} />
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+
+      {/* Search Results */}
+      {showSearchResults && searchResults.length > 0 && (
+        <View style={[styles.searchResultsContainer, { backgroundColor: isDark ? '#1A2332' : '#FFFFFF', borderBottomColor: isDark ? '#2D3E52' : '#E5E7EB' }]}>
+          {searchResults.slice(0, 5).map((result, idx) => (
+            <TouchableOpacity
+              key={idx}
+              style={[styles.searchResultItem, { borderBottomColor: isDark ? '#2D3E52' : '#E5E7EB' }]}
+              onPress={() => navigateToSearchResult(result)}
+            >
+              <Ionicons name="location" size={16} color={isDark ? '#63B3ED' : '#3182CE'} />
+              <Text style={[styles.searchResultText, { color: isDark ? '#E2E8F0' : '#1A202C' }]} numberOfLines={1}>
+                {result.display_name}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+
       {/* Map */}
       <View style={styles.mapContainer}>
         <MapView
@@ -753,60 +910,198 @@ const MapScreen: React.FC = () => {
           {/* Map markers and overlays */}
           {renderMapMarkers()}
           {safeZones.map((z) => (<Circle key={z.id} center={{ latitude: z.latitude, longitude: z.longitude }} radius={z.radius} strokeColor="rgba(34,139,34,0.6)" fillColor="rgba(34,139,34,0.15)" />))}
-          {favorites.map((f, idx) => (<Marker key={`fav-${idx}`} coordinate={{ latitude: f.latitude, longitude: f.longitude }} pinColor="purple" />))}
+          {favorites.map((f, idx) => (
+            <Marker 
+              key={`fav-${idx}`} 
+              coordinate={{ latitude: f.latitude, longitude: f.longitude }} 
+              pinColor="purple"
+              onPress={() => {
+                setSelectedLocation({ latitude: f.latitude, longitude: f.longitude, display_name: `Favorite ${idx + 1}` });
+                setShowLocationDetails(true);
+              }}
+            />
+          ))}
           {tempZoneCoords && <Marker coordinate={tempZoneCoords} pinColor="orange" />}
+          {/* Pinned location marker */}
+          {pinnedLocation && (
+            <Marker
+              coordinate={pinnedLocation}
+              pinColor="red"
+              title={selectedLocation?.display_name || 'Selected Location'}
+              onPress={() => setShowLocationDetails(true)}
+            />
+          )}
           {/* route polyline */}
           {routeCoords && routeCoords.length > 0 && (
-            <Polyline coordinates={routeCoords} strokeWidth={4} lineDashPattern={[1]} />
+            <>
+              <Polyline coordinates={routeCoords} strokeWidth={5} strokeColor="#3B82F6" lineDashPattern={[5, 5]} />
+              {routeCoords.length > 0 && (
+                <Marker 
+                  coordinate={routeCoords[routeCoords.length - 1]} 
+                  title="Destination"
+                  pinColor="#10B981"
+                />
+              )}
+            </>
           )}
         </MapView>
       </View>
       {/* Footer (bottom panel) */}
-      <View style={[styles.footer, { backgroundColor: isDark ? '#0B1220' : '#FFFFFF' }]}>
+      <View style={[styles.footer, { backgroundColor: isDark ? '#1A2332' : '#FFFFFF', borderTopColor: isDark ? '#2D3E52' : '#E5E7EB' }]}>
         <View style={styles.locationInfo}>
-          <Ionicons name="location" size={20} color={isDark ? '#63B3ED' : '#3182CE'} style={styles.locationIcon} />
+          <View style={[styles.locationIconBg, { backgroundColor: isDark ? '#2D3E52' : '#EFF6FF' }]}>
+            <Ionicons name="location" size={18} color={isDark ? '#63B3ED' : '#3182CE'} />
+          </View>
           <View style={{ flex: 1 }}>
             <Text style={[styles.addressTitle, { color: isDark ? '#E2E8F0' : '#1A202C' }]}>Current Location</Text>
             <Text style={[styles.address, { color: isDark ? '#9CA3AF' : '#4A5568' }]}>{currentLocation.latitude.toFixed(6)}, {currentLocation.longitude.toFixed(6)}</Text>
             <Text style={[styles.smallText, { color: isDark ? '#9CA3AF' : '#718096' }]} numberOfLines={2}>{currentAddress || 'Address: —'}</Text>
           </View>
         </View>
-        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-          <TouchableOpacity style={styles.footerButton} onPress={() => mapRef.current?.animateToRegion({ latitude: currentLocation.latitude, longitude: currentLocation.longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 350)}>
-            <Ionicons name="locate" size={20} color="white" />
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.footerButton, { backgroundColor: '#2F855A' }]} onPress={saveHome}>
-            <Ionicons name="home" size={20} color="white" />
-          </TouchableOpacity>
-        </View>
+        <TouchableOpacity style={[styles.footerButton, { backgroundColor: '#8B5CF6' }]} onPress={navigateToHomeLocation} activeOpacity={0.8}>
+          <Ionicons name="settings" size={20} color="white" />
+        </TouchableOpacity>
       </View>
-      {/* Home Navigation Button */}
-      <TouchableOpacity
-        style={[styles.navButton, isDark && styles.navButtonDark, { bottom: 120 }]}
-        onPress={navigateToHome}
-      >
-        <Ionicons name="home" size={24} color={isDark ? '#fff' : '#000'} />
-      </TouchableOpacity>
+      {/* Floating Action Buttons */}
+      <View style={styles.floatingButtonsContainer}>
+        {/* Current Location Button */}
+        <TouchableOpacity
+          style={[styles.floatingButton, { backgroundColor: isDark ? '#3B82F6' : '#3B82F6' }]}
+          onPress={centerOnUserLocation}
+          accessibilityLabel="Center on current location"
+          activeOpacity={0.8}
+        >
+          <Ionicons name="locate" size={24} color="white" />
+        </TouchableOpacity>
 
-      {/* SOS Button */}
-      <TouchableOpacity
-        style={[styles.sosButton, isDark && styles.sosButtonDark]}
-        onPress={triggerSOS}
-      >
-        <Text style={styles.sosButtonText}>{sosText ?? 'SOS'}</Text>
-      </TouchableOpacity>
+        {/* Navigate to Home Button */}
+        <TouchableOpacity
+          style={[styles.floatingButton, { backgroundColor: isDark ? '#10B981' : '#10B981' }]}
+          onPress={navigateToHomeWithRoute}
+          accessibilityLabel="Navigate to home"
+          activeOpacity={0.8}
+        >
+          <Ionicons name="home" size={24} color="white" />
+        </TouchableOpacity>
+
+        {/* General Navigation Button */}
+        <TouchableOpacity
+          style={[styles.floatingButton, { backgroundColor: isDark ? '#F59E0B' : '#F59E0B' }]}
+          onPress={() => {
+            setSearchQuery('');
+            setSearchResults([]);
+            setShowSearchResults(true);
+          }}
+          accessibilityLabel="Search and navigate"
+          activeOpacity={0.8}
+        >
+          <Ionicons name="navigate-circle" size={24} color="white" />
+        </TouchableOpacity>
+      </View>
+
+      {/* Location Details Card */}
+      {showLocationDetails && selectedLocation && !isNavigating && (
+        <View style={[styles.locationDetailsCard, { backgroundColor: isDark ? '#1A2332' : '#FFFFFF', borderTopColor: isDark ? '#2D3E52' : '#E5E7EB' }]}>
+          <View style={styles.locationDetailsHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.locationDetailsTitle, { color: isDark ? '#E2E8F0' : '#1A202C' }]} numberOfLines={2}>
+                {selectedLocation.display_name}
+              </Text>
+              <Text style={[styles.locationDetailsCoords, { color: isDark ? '#9CA3AF' : '#6B7280' }]}>
+                {selectedLocation.latitude.toFixed(4)}, {selectedLocation.longitude.toFixed(4)}
+              </Text>
+            </View>
+            <TouchableOpacity 
+              onPress={() => {
+                setShowLocationDetails(false);
+                setSelectedLocation(null);
+              }}
+              style={styles.closeDetailsButton}
+            >
+              <Ionicons name="close" size={24} color={isDark ? '#E2E8F0' : '#1A202C'} />
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.locationDetailsButtons}>
+            <TouchableOpacity
+              style={[styles.detailsButton, { backgroundColor: isDark ? '#3B82F6' : '#3B82F6' }]}
+              onPress={() => {
+                setShowLocationDetails(false);
+                startNavigationTo(selectedLocation.latitude, selectedLocation.longitude);
+              }}
+            >
+              <Ionicons name="navigate" size={18} color="white" />
+              <Text style={styles.detailsButtonText}>Nav</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.detailsButton, { backgroundColor: isDark ? '#EF4444' : '#EF4444' }]}
+              onPress={() => {
+                setPinnedLocation({ latitude: selectedLocation.latitude, longitude: selectedLocation.longitude });
+              }}
+            >
+              <Ionicons name="pin" size={18} color="white" />
+              <Text style={styles.detailsButtonText}>Pin</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.detailsButton, { backgroundColor: isDark ? '#10B981' : '#10B981' }]}
+              onPress={() => {
+                mapRef.current?.animateToRegion({
+                  latitude: selectedLocation.latitude,
+                  longitude: selectedLocation.longitude,
+                  latitudeDelta: 0.02,
+                  longitudeDelta: 0.02,
+                });
+              }}
+            >
+              <Ionicons name="eye" size={18} color="white" />
+              <Text style={styles.detailsButtonText}>View</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.detailsButton, { backgroundColor: isDark ? '#8B5CF6' : '#8B5CF6' }]}
+              onPress={() => {
+                const message = `Location: ${selectedLocation.display_name}\nCoordinates: ${selectedLocation.latitude.toFixed(4)}, ${selectedLocation.longitude.toFixed(4)}`;
+                Share.share({
+                  message,
+                  title: 'Share Location',
+                });
+              }}
+            >
+              <Ionicons name="share-social" size={18} color="white" />
+              <Text style={styles.detailsButtonText}>Share</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
 
       {/* Navigation Controls */}
       {isNavigating && (
         <View style={[styles.navigationControls, isDark && styles.navigationControlsDark]}>
-          <Text style={[styles.navInstruction, isDark && styles.darkText]}>
-            {routeSteps[0]?.instruction || 'Navigating...'}
-          </Text>
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.navInstruction, isDark && styles.darkText]}>
+              {routeSteps[0]?.instruction || 'Navigating...'}
+            </Text>
+            <View style={styles.navInfoRow}>
+              <Text style={[styles.navInfo, isDark && styles.darkText]}>
+                📍 {(totalDistance / 1000).toFixed(1)} km
+              </Text>
+              <Text style={[styles.navInfo, isDark && styles.darkText]}>
+                ⏱️ {Math.ceil(totalDuration / 60)} min
+              </Text>
+              {routeSteps[0]?.distance && (
+                <Text style={[styles.navInfo, isDark && styles.darkText]}>
+                  → {(routeSteps[0].distance / 1000).toFixed(2)} km
+                </Text>
+              )}
+            </View>
+          </View>
           <TouchableOpacity 
             style={styles.stopNavButton}
             onPress={stopNavigation}
           >
-            <Text style={styles.stopNavText}>Stop Navigation</Text>
+            <Text style={styles.stopNavText}>Stop</Text>
           </TouchableOpacity>
         </View>
       )}
@@ -859,52 +1154,7 @@ export default MapScreen;
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    position: 'relative',
-  },
-  floatingButtons: {
-    position: 'absolute',
-    right: 16,
-    bottom: 100,
-    alignItems: 'center',
-  },
-  fab: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginVertical: 8,
-    elevation: 4,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 3,
-  },
-  locationButton: {
     backgroundColor: '#fff',
-  },
-  homeButton: {
-    backgroundColor: '#fff',
-  },
-  navigationButton: {
-    backgroundColor: '#fff',
-  },
-  stopButton: {
-    backgroundColor: '#ff3b30',
-  },
-  sosButton: {
-    backgroundColor: '#ff3b30',
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-  },
-  darkButton: {
-    backgroundColor: '#333',
-  },
-  sosText: {
-    color: '#fff',
-    fontWeight: 'bold',
-    fontSize: 16,
   },
   header: {
     padding: 12,
@@ -927,135 +1177,260 @@ const styles = StyleSheet.create({
     marginLeft: 8,
   },
   shareButtonText: { color: 'white', marginLeft: 6, fontWeight: '600' },
-  mapContainer: { flex: 1 },
+  mapContainer: { flex: 1, overflow: 'hidden' },
   map: { width: '100%', height: '100%' },
   footer: {
-    padding: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderTopWidth: 1,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    gap: 12,
   },
-  locationInfo: { flexDirection: 'row', alignItems: 'center', flex: 1 },
-  locationIcon: { marginRight: 12 },
-  addressTitle: { fontSize: 14, fontWeight: '700' },
-  address: { fontSize: 12 },
-  smallText: { fontSize: 11 },
+  locationInfo: { flexDirection: 'row', alignItems: 'center', flex: 1, gap: 12 },
+  locationIconBg: {
+    width: 40,
+    height: 40,
+    borderRadius: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  addressTitle: { fontSize: 13, fontWeight: '600' },
+  address: { fontSize: 11, marginTop: 2 },
+  smallText: { fontSize: 10, marginTop: 2 },
   footerButton: {
     width: 44,
+    height: 44,
     borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 3,
   },
-  navButton: {
+  floatingButtonsContainer: {
     position: 'absolute',
-    right: 20,
-    backgroundColor: '#f0f0f0',
+    right: 16,
+    bottom: 140,
+    alignItems: 'center',
+    gap: 12,
+  },
+  floatingButton: {
     width: 60,
     height: 60,
     borderRadius: 30,
     justifyContent: 'center',
     alignItems: 'center',
-    elevation: 5,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3.84,
-  },
-  navButtonDark: {
-    backgroundColor: '#333',
-  },
-  sosButton: {
-    position: 'absolute',
-    bottom: 30,
-    right: 20,
-    backgroundColor: '#ff3b30',
-    width: 68,
-    height: 68,
-    borderRadius: 34,
-    justifyContent: 'center',
-    alignItems: 'center',
     elevation: 8,
-  },
-  sosButtonDark: {
-    backgroundColor: '#cc2e24',
-  },
-  sosButtonText: {
-    color: 'white',
-    fontWeight: 'bold',
-    fontSize: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.35,
+    shadowRadius: 5,
   },
   navigationControls: {
     position: 'absolute',
-    bottom: 100,
-    left: 20,
-    right: 20,
+    bottom: 80,
+    left: 16,
+    right: 16,
     backgroundColor: 'white',
-    borderRadius: 10,
-    padding: 15,
+    borderRadius: 12,
+    padding: 16,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    elevation: 5,
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 5,
   },
   navigationControlsDark: {
     backgroundColor: '#333',
   },
   navInstruction: {
-    flex: 1,
-    marginRight: 10,
-    color: '#333',
+    color: '#1F2937',
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 6,
+  },
+  navInfoRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 6,
+  },
+  navInfo: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#6B7280',
   },
   darkText: {
     color: '#fff',
   },
   stopNavButton: {
-    backgroundColor: '#ff3b30',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 5,
+    backgroundColor: '#EF4444',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 2,
   },
   stopNavText: {
     color: 'white',
-    fontWeight: 'bold',
+    fontWeight: '600',
+    fontSize: 13,
   },
   modalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
+    backgroundColor: 'rgba(0,0,0,0.6)',
     justifyContent: 'center',
     alignItems: 'center',
     padding: 20,
   },
   modalContent: {
     backgroundColor: 'white',
-    borderRadius: 10,
-    padding: 20,
+    borderRadius: 16,
+    padding: 24,
     width: '100%',
     maxWidth: 400,
+    elevation: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 5 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
   },
   modalTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    marginBottom: 15,
+    fontSize: 20,
+    fontWeight: '700',
+    marginBottom: 12,
+    color: '#1F2937',
   },
   modalButtonPrimary: {
-    padding: 12,
-    borderRadius: 8,
-    backgroundColor: '#2F855A',
+    padding: 14,
+    borderRadius: 10,
+    backgroundColor: '#10B981',
     minWidth: 120,
     alignItems: 'center',
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 3,
   },
   modalButtonCancel: {
-    padding: 12,
-    borderRadius: 8,
-    backgroundColor: '#E2E8F0',
+    padding: 14,
+    borderRadius: 10,
+    backgroundColor: '#F3F4F6',
     minWidth: 120,
     alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
   },
   input: { 
-    padding: 10, 
-    borderRadius: 8, 
-    marginVertical: 8,
-    backgroundColor: '#FFFFFF',
-    color: '#000000'
-  }
+    padding: 12, 
+    borderRadius: 10, 
+    marginVertical: 10,
+    backgroundColor: '#F9FAFB',
+    color: '#000000',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    fontSize: 14,
+  },
+  searchContainer: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+  },
+  searchBarWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    gap: 8,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: 14,
+    paddingVertical: 4,
+  },
+  searchResultsContainer: {
+    maxHeight: 200,
+    borderBottomWidth: 1,
+  },
+  searchResultItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    gap: 10,
+  },
+  searchResultText: {
+    flex: 1,
+    fontSize: 13,
+  },
+  locationDetailsCard: {
+    position: 'absolute',
+    bottom: 80,
+    left: 16,
+    right: 16,
+    borderTopWidth: 1,
+    borderRadius: 12,
+    padding: 16,
+    elevation: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 5 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+  },
+  locationDetailsHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  locationDetailsTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  locationDetailsCoords: {
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  closeDetailsButton: {
+    padding: 4,
+  },
+  locationDetailsButtons: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  detailsButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    gap: 6,
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 3,
+  },
+  detailsButtonText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: '600',
+  },
 });
 
 // Notes for maintainers:
