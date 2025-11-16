@@ -1,4 +1,4 @@
-import { supabase } from '../../supabaseConfig';
+import { supabase } from '../lib/supabase';
 
 type SeniorData = {
   id?: string;

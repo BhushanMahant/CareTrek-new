@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
 import { View, ActivityIndicator } from 'react-native';
-import { supabase } from '../../supabaseConfig';
+import { supabase } from '../lib/supabase';
 import { Session } from '@supabase/supabase-js';
 
 // User type

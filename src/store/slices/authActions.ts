@@ -1,6 +1,6 @@
 import { createAsyncThunk } from '@reduxjs/toolkit';
 import { UserRole } from './authSlice';
-import { supabase } from '../../supabaseConfig';
+import { supabase } from '../../lib/supabase';
 
 export const signIn = createAsyncThunk(
   'auth/signIn',

@@ -1,4 +1,4 @@
-import { supabase } from '../../supabaseConfig';
+import { supabase } from '../lib/supabase';
 
 // Generate a random family key
 export const generateFamilyKey = (): string => {
